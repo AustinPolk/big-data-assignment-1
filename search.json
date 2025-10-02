@@ -1,6 +1,16 @@
 {
-
-	"single-term-queries": ["action", "funny", "romantic", "crime", "sci-fi"],
-
-	"multi-term-queries":  []
+  "single-term-queries": [
+    "action",
+    "funny",
+    "romantic",
+    "crime",
+    "horror"
+  ],
+  "multi-term-queries": [
+    "funny movie with action scenes",
+    "romantic adventurous movie",
+    "thriller action with crime",
+    "horror comedy movie",
+    "mystery funny drama story"
+  ]
 }
