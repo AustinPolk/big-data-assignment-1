@@ -1,6 +1,7 @@
 import os
 import nltk
 import math
+import json
 from pyspark import SparkConf, SparkContext
 
 # Download the nltk necessity files
@@ -39,7 +40,7 @@ def tokenize_and_remove_stop_words(document: str) -> list:
 
     tokens = word_tokenize(document.lower())
 
-    return [token for token in tokens if token not in STOPWORDS]
+    return [token for token in tokens if  token.isalpha() and token not in STOPWORDS]
 
 
 if __name__ == "__main__":
@@ -57,7 +58,7 @@ if __name__ == "__main__":
     # Metadata: wiki_id -> movie_name
     meta_rdd = sc.textFile(meta_path)
 
-    id_name = (
+    movie_name = (
         meta_rdd
         .map(lambda line: line.split("\t"))
         .filter(lambda parts: len(parts) > 2)
@@ -65,7 +66,7 @@ if __name__ == "__main__":
         .collectAsMap()
     )
 
-    b_id_name = sc.broadcast(id_name)
+    b_movie_name = sc.broadcast(movie_name)
 
     # Plots: (wiki_id, summary)
     plots_rdd = (
@@ -78,37 +79,88 @@ if __name__ == "__main__":
     # Tokenize the plots rdd
     tokens_rdd = plots_rdd.mapValues(tokenize_and_remove_stop_words)
 
+    # -------------------------
+    # LOGIC FOR TF CALCULATION
+    # -------------------------
+
     # TF Term Frequencies: (wiki_id, word) -> count
     tf_rdd = (
         tokens_rdd
-        .flatMapValues(lambda tokens: tokens)
-        .map(lambda x: ((x[0], x[1]), 1))       # ((wiki_id, word) 1) eg: ((23890098, 'hard-working'), 1)
-        .reduceByKey(lambda a, b: a+b)
+        .flatMapValues(lambda tokens: tokens)  # (wiki_id, word)
+        .map(lambda x: ((x[0], x[1]), 1))      # ((wiki_id, word), 1)
+        .reduceByKey(lambda a, b: a + b)       # ((wiki_id, word), count)
     )
-    
-    # DF Document Frequencies: word -> set of documents
+
+    # TF Total Words: (wiki_id, length of summary tokens)
+    summary_len_rdd = (
+        tokens_rdd
+        .map(lambda x: (x[0], len(x[1])))   # (wiki_id, summary_token_len) eg: (23890098, 5)
+    )
+
+    # Reshape the tf_rdd
+    tf_by_doc_rdd = tf_rdd.map(lambda x: (x[0][0], (x[0][1], x[1])))  # (wiki_id, (word, count))
+
+    tf_normalized_rdd = (
+        tf_by_doc_rdd
+        .join(summary_len_rdd)                                     # (wiki_id, ((word, count), summary_len)) eg: (23890098, ('hard-working',1), 5)
+        .map(lambda x: ((x[0], x[1][0][0]), x[1][0][1]/x[1][1]))   # ((wiki_id, word), TF) eg. ((23890098, 'hard-working'), 0.2)
+    )
+
+    # -------------------------
+    # LOGIC FOR IDF CALCULATION
+    # -------------------------
+
+    # DF: word -> number of documents containing it
     df_rdd = (
         tf_rdd
-        .map(lambda x: (x[0][1],x[0][0]))   # (word, wiki_id) eg: ('hard-working', 23890098)
+        .map(lambda x: (x[0][1], x[0][0]))   # (word, wiki_id)
         .distinct()
-        .map(lambda x: (x[0], 1))              # (word, 1) eg: ('hard-working', 1)
-        .reduceByKey(lambda a, b: a+b)
+        .map(lambda x: (x[0], 1))            # (word, 1)
+        .reduceByKey(lambda a, b: a + b)     # (word, df)
     )
 
     # Total number of documents
     N = tokens_rdd.count() 
 
     # IDF = log(total no. of docs / total no. of docs containting term)
-    idf_rdd = df_rdd.mapValues(lambda df: math.log(N / df)) 
+    idf_rdd = df_rdd.mapValues(lambda df: math.log(N / df))
 
     # (word -> idf) as dictionary for broadcast
     idf_dict = dict(idf_rdd.collect())
     b_idf = sc.broadcast(idf_dict)
 
-    # Calculate TF-IDF
-    tfidf_rdd = tf_rdd.map(lambda x: (x[0], x[1] * b_idf.value.get(x[0][1], 0.0)))
-    
+    # ----------------------------
+    # LOGIC FOR TF-IDF CALCULATION
+    # ----------------------------
 
 
-    
+    # Compute TF-IDF
+    tfidf_rdd = tf_normalized_rdd.map(
+        lambda x: (x[0], x[1] * b_idf.value.get(x[0][1], 0.0))  # ((wiki_id, word), tfidf)
+    )
+
+
+    # === Search Query (single term) ===
+
+    with open("search.json","r") as f:
+        search_data = json.load(f)
+
+    single_term_queries = search_data["single-term-queries"]   
+
+    for query in single_term_queries:
+        # Filter tf-idf only for this query word
+        results = (
+            tfidf_rdd
+            .filter(lambda x: x[0][1] == query)             
+            .map(lambda x: (x[0][0], x[1]))                  # (wiki_id, tfidf)
+            .sortBy(lambda x: -x[1])                         
+            .take(10)                                        
+        )
+
+        print(f"\n\nTop 10 results for word: '{query}'\n")
+        for wiki_id, score in results:
+            mname = b_movie_name.value.get(wiki_id, "Unknown")
+            print(f"\t{mname}: {score}")
+
+            
 
